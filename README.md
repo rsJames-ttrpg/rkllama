@@ -451,7 +451,20 @@ See the [Configuration Documentation](documentation/configuration.md) for comple
 
 # Changelog
 
-## 1.2.3-3 (Upcoming)
+## 1.2.3-5 (Upcoming)
+
+**Regex Model Routing**: Router now supports regex patterns for model matching.
+- Send `model: "qwen3.*"` and router matches against loaded models (e.g., `qwen3-1.7b`)
+- Automatically rewrites request body with the matched model name
+- Enables flexible model aliases without explicit configuration
+
+**DaemonSet Update Strategy**: Changed to `OnDelete` to prevent NPU resource deadlock during rolling updates.
+- Old pods must be manually deleted before new pods can acquire the NPU
+- Prevents pending pod deadlock when updating DaemonSet
+
+---
+
+## 1.2.3-4
 
 **Inference Concurrency Control**: Added global inference lock to prevent concurrent requests from corrupting model output on the NPU.
 - Each pod now processes one inference request at a time
