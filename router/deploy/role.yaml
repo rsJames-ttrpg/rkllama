@@ -1,4 +1,4 @@
-# Role to access pods and configmaps
+# Role to access pods, configmaps, and secrets
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -9,4 +9,7 @@ rules:
     verbs: ["get", "list", "watch"]
   - apiGroups: [""]
     resources: ["configmaps"]
+    verbs: ["get", "watch"]
+  - apiGroups: [""]
+    resources: ["secrets"]
     verbs: ["get", "watch"]

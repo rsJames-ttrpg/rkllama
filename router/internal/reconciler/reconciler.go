@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"sync"
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -29,9 +30,47 @@ type ModelConfig struct {
 	Priority int `yaml:"priority,omitempty"`
 }
 
+// RateLimitConfig configures the circuit breaker for rate limiting
+type RateLimitConfig struct {
+	Threshold int `yaml:"threshold,omitempty"` // 429s before tripping (default: 3)
+	Window    int `yaml:"window,omitempty"`    // seconds to count 429s in (default: 60)
+	Cooldown  int `yaml:"cooldown,omitempty"`  // seconds to wait before retrying (default: 60)
+}
+
+// ExternalServer represents an external Ollama-compatible server
+type ExternalServer struct {
+	Name      string              `yaml:"name"`
+	URL       string              `yaml:"url"`
+	Weight    int                 `yaml:"weight,omitempty"` // default 1, number of slots in round-robin
+	RateLimit *RateLimitConfig    `yaml:"rateLimit,omitempty"`
+	Auth      *ExternalServerAuth `yaml:"auth,omitempty"`
+}
+
+// ExternalServerAuth configures authentication for an external server
+type ExternalServerAuth struct {
+	Type      string    `yaml:"type"` // "bearer" or "api-key"
+	SecretRef SecretRef `yaml:"secretRef"`
+}
+
+// SecretRef references a Kubernetes secret
+type SecretRef struct {
+	Name string `yaml:"name"`
+	Key  string `yaml:"key"`
+}
+
 // Config represents the model assignment configuration
 type Config struct {
-	Models map[string]ModelConfig `yaml:"models"`
+	Models          map[string]ModelConfig `yaml:"models"`
+	ExternalServers []ExternalServer       `yaml:"externalServers,omitempty"`
+}
+
+// ResolvedExternalServer contains an external server config with resolved auth token
+type ResolvedExternalServer struct {
+	Name   string
+	URL    string
+	Weight int
+	Token  string // resolved from K8s secret
+	Auth   *ExternalServerAuth
 }
 
 // Reconciler ensures actual model state matches desired state
@@ -42,6 +81,9 @@ type Reconciler struct {
 	discovery  *discovery.Discovery
 	httpClient *http.Client
 	config     *Config
+
+	mu                      sync.RWMutex
+	resolvedExternalServers []ResolvedExternalServer
 }
 
 // New creates a new Reconciler
@@ -266,7 +308,117 @@ func (r *Reconciler) loadConfig(ctx context.Context) error {
 	}
 
 	r.config = &config
+
+	// Resolve external server secrets
+	if err := r.resolveExternalServers(ctx); err != nil {
+		slog.Error("failed to resolve external server secrets", "error", err)
+	}
+
 	return nil
+}
+
+// resolveExternalServers fetches secrets and builds resolved external server list
+func (r *Reconciler) resolveExternalServers(ctx context.Context) error {
+	if r.config == nil || len(r.config.ExternalServers) == 0 {
+		r.mu.Lock()
+		r.resolvedExternalServers = nil
+		r.mu.Unlock()
+		// Clear external servers in discovery
+		r.discovery.SetExternalServers(nil)
+		return nil
+	}
+
+	resolved := make([]ResolvedExternalServer, 0, len(r.config.ExternalServers))
+	discoveryConfigs := make([]discovery.ExternalServerConfig, 0, len(r.config.ExternalServers))
+
+	for _, es := range r.config.ExternalServers {
+		server := ResolvedExternalServer{
+			Name:   es.Name,
+			URL:    es.URL,
+			Weight: es.Weight,
+			Auth:   es.Auth,
+		}
+
+		// Default weight to 1
+		if server.Weight <= 0 {
+			server.Weight = 1
+		}
+
+		// Resolve auth token from secret if configured
+		if es.Auth != nil && es.Auth.SecretRef.Name != "" {
+			token, err := r.fetchSecretValue(ctx, es.Auth.SecretRef.Name, es.Auth.SecretRef.Key)
+			if err != nil {
+				slog.Error("failed to fetch secret for external server",
+					"server", es.Name,
+					"secret", es.Auth.SecretRef.Name,
+					"error", err)
+				// Continue without token - server may still work for unauthenticated endpoints
+			} else {
+				server.Token = token
+			}
+		}
+
+		resolved = append(resolved, server)
+
+		// Build discovery config
+		authType := ""
+		if es.Auth != nil {
+			authType = es.Auth.Type
+		}
+
+		// Rate limit settings (with defaults)
+		rateLimitThreshold := 3
+		rateLimitWindow := 60
+		rateLimitCooldown := 60
+		if es.RateLimit != nil {
+			if es.RateLimit.Threshold > 0 {
+				rateLimitThreshold = es.RateLimit.Threshold
+			}
+			if es.RateLimit.Window > 0 {
+				rateLimitWindow = es.RateLimit.Window
+			}
+			if es.RateLimit.Cooldown > 0 {
+				rateLimitCooldown = es.RateLimit.Cooldown
+			}
+		}
+
+		discoveryConfigs = append(discoveryConfigs, discovery.ExternalServerConfig{
+			Name:               es.Name,
+			URL:                es.URL,
+			Weight:             server.Weight,
+			Token:              server.Token,
+			AuthType:           authType,
+			RateLimitThreshold: rateLimitThreshold,
+			RateLimitWindow:    rateLimitWindow,
+			RateLimitCooldown:  rateLimitCooldown,
+		})
+
+		slog.Debug("resolved external server", "name", es.Name, "url", es.URL, "weight", server.Weight, "has_token", server.Token != "")
+	}
+
+	r.mu.Lock()
+	r.resolvedExternalServers = resolved
+	r.mu.Unlock()
+
+	// Update discovery with external server configs
+	r.discovery.SetExternalServers(discoveryConfigs)
+
+	return nil
+}
+
+// fetchSecretValue retrieves a specific key from a Kubernetes secret
+func (r *Reconciler) fetchSecretValue(ctx context.Context, secretName, key string) (string, error) {
+	secret, err := r.client.CoreV1().Secrets(r.namespace).Get(ctx, secretName, metav1.GetOptions{})
+	if err != nil {
+		return "", fmt.Errorf("failed to get secret %s: %w", secretName, err)
+	}
+
+	data, ok := secret.Data[key]
+	if !ok {
+		return "", fmt.Errorf("key %s not found in secret %s", key, secretName)
+	}
+
+	return string(data), nil
 }
 
 // loadModel calls /api/load on a pod
@@ -326,4 +478,15 @@ func (r *Reconciler) unloadModel(ctx context.Context, pod *discovery.Pod, model 
 // GetConfig returns the current configuration
 func (r *Reconciler) GetConfig() *Config {
 	return r.config
+}
+
+// GetExternalServers returns the resolved external servers with auth tokens
+func (r *Reconciler) GetExternalServers() []ResolvedExternalServer {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	// Return a copy to avoid race conditions
+	result := make([]ResolvedExternalServer, len(r.resolvedExternalServers))
+	copy(result, r.resolvedExternalServers)
+	return result
 }

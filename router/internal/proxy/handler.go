@@ -98,16 +98,21 @@ func (h *Handler) Proxy(w http.ResponseWriter, r *http.Request) {
 		slog.Warn("failed to resolve model pattern", "pattern", model, "error", err)
 	}
 
-	// Find a pod with the model loaded
-	pod := h.discovery.GetNextPodForModel(resolvedModel)
-	if pod == nil {
-		slog.Warn("no pod found for model", "model", resolvedModel, "original_pattern", model)
-		http.Error(w, fmt.Sprintf("model %q not loaded on any pod", model), http.StatusServiceUnavailable)
+	// Find an endpoint (pod or external server) with the model loaded
+	endpoint := h.discovery.GetNextEndpointForModel(resolvedModel)
+	if endpoint == nil {
+		slog.Warn("no endpoint found for model", "model", resolvedModel, "original_pattern", model)
+		http.Error(w, fmt.Sprintf("model %q not loaded on any endpoint", model), http.StatusServiceUnavailable)
 		return
 	}
 
-	slog.Debug("routing request", "model", resolvedModel, "pattern", model, "pod", pod.Name, "path", r.URL.Path)
-	h.proxyToPod(w, r, pod, body)
+	if endpoint.Pod != nil {
+		slog.Debug("routing request to pod", "model", resolvedModel, "pattern", model, "pod", endpoint.Pod.Name, "path", r.URL.Path)
+		h.proxyToPod(w, r, endpoint.Pod, body)
+	} else if endpoint.ExternalServer != nil {
+		slog.Debug("routing request to external server", "model", resolvedModel, "pattern", model, "server", endpoint.ExternalServer.Name, "path", r.URL.Path)
+		h.proxyToExternalServer(w, r, endpoint.ExternalServer, body)
+	}
 }
 
 // extractModel reads the request body and extracts the model field
@@ -242,16 +247,61 @@ func (h *Handler) proxyToPod(w http.ResponseWriter, r *http.Request, pod *discov
 	proxy.ServeHTTP(w, r)
 }
 
-// aggregateTags aggregates /api/tags from all pods
-func (h *Handler) aggregateTags(w http.ResponseWriter, _ *http.Request) {
-	pods := h.discovery.GetAllPods()
-	if len(pods) == 0 {
-		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{"models":[]}`))
+// proxyToExternalServer proxies the request to an external server with auth
+func (h *Handler) proxyToExternalServer(w http.ResponseWriter, r *http.Request, server *discovery.ExternalServerState, body []byte) {
+	target, err := url.Parse(server.URL)
+	if err != nil {
+		slog.Error("invalid external server URL", "server", server.Name, "url", server.URL, "error", err)
+		http.Error(w, "invalid external server URL", http.StatusInternalServerError)
 		return
 	}
 
-	// Collect unique models across all pods
+	proxy := &httputil.ReverseProxy{
+		Director: func(req *http.Request) {
+			req.URL.Scheme = target.Scheme
+			req.URL.Host = target.Host
+			req.Host = target.Host
+
+			// Restore body if we read it
+			if body != nil {
+				req.Body = io.NopCloser(bytes.NewReader(body))
+				req.ContentLength = int64(len(body))
+			}
+
+			// Add auth header if configured
+			if server.Token != "" {
+				switch server.AuthType {
+				case "bearer":
+					req.Header.Set("Authorization", "Bearer "+server.Token)
+				case "api-key":
+					req.Header.Set("X-API-Key", server.Token)
+				}
+			}
+		},
+		// Intercept response to detect rate limiting
+		ModifyResponse: func(resp *http.Response) error {
+			if resp.StatusCode == http.StatusTooManyRequests {
+				h.discovery.Record429(server.Name)
+			}
+			return nil
+		},
+		// Streaming support: don't buffer response
+		FlushInterval: -1,
+		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			slog.Error("proxy error", "server", server.Name, "error", err)
+			http.Error(w, "proxy error: "+err.Error(), http.StatusBadGateway)
+		},
+	}
+
+	proxy.ServeHTTP(w, r)
+}
+
+// aggregateTags aggregates /api/tags from all pods and external servers
+func (h *Handler) aggregateTags(w http.ResponseWriter, _ *http.Request) {
+	pods := h.discovery.GetAllPods()
+	externalServers := h.discovery.GetAllExternalServers()
+
+	// Collect unique models across all pods and external servers
 	seen := make(map[string]discovery.ModelInfo)
 	for _, pod := range pods {
 		for _, model := range pod.Models {
@@ -259,6 +309,18 @@ func (h *Handler) aggregateTags(w http.ResponseWriter, _ *http.Request) {
 				seen[model] = discovery.ModelInfo{
 					Name:  model,
 					Model: model,
+				}
+			}
+		}
+	}
+	for _, server := range externalServers {
+		if server.Healthy {
+			for _, model := range server.Models {
+				if _, ok := seen[model]; !ok {
+					seen[model] = discovery.ModelInfo{
+						Name:  model,
+						Model: model,
+					}
 				}
 			}
 		}
@@ -275,15 +337,18 @@ func (h *Handler) aggregateTags(w http.ResponseWriter, _ *http.Request) {
 	})
 }
 
-// aggregatePS aggregates /api/ps from all pods
+// aggregatePS aggregates /api/ps from all pods and external servers
 func (h *Handler) aggregatePS(w http.ResponseWriter, _ *http.Request) {
 	pods := h.discovery.GetAllPods()
+	externalServers := h.discovery.GetAllExternalServers()
 
 	type runningModel struct {
-		Name     string `json:"name"`
-		Model    string `json:"model"`
-		NodeName string `json:"node_name"`
-		PodName  string `json:"pod_name"`
+		Name       string `json:"name"`
+		Model      string `json:"model"`
+		NodeName   string `json:"node_name,omitempty"`
+		PodName    string `json:"pod_name,omitempty"`
+		ServerName string `json:"server_name,omitempty"`
+		External   bool   `json:"external"`
 	}
 
 	running := make([]runningModel, 0)
@@ -294,7 +359,20 @@ func (h *Handler) aggregatePS(w http.ResponseWriter, _ *http.Request) {
 				Model:    model,
 				NodeName: pod.NodeName,
 				PodName:  pod.Name,
+				External: false,
 			})
+		}
+	}
+	for _, server := range externalServers {
+		if server.Healthy {
+			for _, model := range server.Models {
+				running = append(running, runningModel{
+					Name:       model,
+					Model:      model,
+					ServerName: server.Name,
+					External:   true,
+				})
+			}
 		}
 	}
 
@@ -307,6 +385,7 @@ func (h *Handler) aggregatePS(w http.ResponseWriter, _ *http.Request) {
 // routerStatus returns detailed router status
 func (h *Handler) routerStatus(w http.ResponseWriter, _ *http.Request) {
 	pods := h.discovery.GetAllPods()
+	externalServers := h.discovery.GetAllExternalServers()
 
 	type podStatus struct {
 		Name     string   `json:"name"`
@@ -314,6 +393,18 @@ func (h *Handler) routerStatus(w http.ResponseWriter, _ *http.Request) {
 		NodeName string   `json:"node_name"`
 		Ready    bool     `json:"ready"`
 		Models   []string `json:"models"`
+	}
+
+	type externalServerStatus struct {
+		Name             string   `json:"name"`
+		URL              string   `json:"url"`
+		Healthy          bool     `json:"healthy"`
+		FailureCount     int      `json:"failure_count"`
+		Models           []string `json:"models"`
+		Weight           int      `json:"weight"`
+		RateLimited      bool     `json:"rate_limited"`
+		RateLimitedUntil string   `json:"rate_limited_until,omitempty"`
+		RateLimit429s    int      `json:"rate_limit_429s"`
 	}
 
 	podStatuses := make([]podStatus, 0, len(pods))
@@ -329,31 +420,61 @@ func (h *Handler) routerStatus(w http.ResponseWriter, _ *http.Request) {
 		totalModels += len(pod.Models)
 	}
 
+	externalStatuses := make([]externalServerStatus, 0, len(externalServers))
+	for _, server := range externalServers {
+		rateLimited := h.discovery.IsServerRateLimited(server.Name)
+		rateLimitedUntil := ""
+		if !server.RateLimitedUntil.IsZero() && rateLimited {
+			rateLimitedUntil = server.RateLimitedUntil.Format(time.RFC3339)
+		}
+
+		externalStatuses = append(externalStatuses, externalServerStatus{
+			Name:             server.Name,
+			URL:              server.URL,
+			Healthy:          server.Healthy,
+			FailureCount:     server.FailureCount,
+			Models:           server.Models,
+			Weight:           server.Weight,
+			RateLimited:      rateLimited,
+			RateLimitedUntil: rateLimitedUntil,
+			RateLimit429s:    len(server.RateLimited429s),
+		})
+		if server.Healthy && !rateLimited {
+			totalModels += len(server.Models)
+		}
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
-		"status":        "ok",
-		"pods":          podStatuses,
-		"pod_count":     len(pods),
-		"model_count":   len(h.discovery.GetAllModels()),
-		"loaded_count":  totalModels,
-		"unique_models": h.discovery.GetAllModels(),
+		"status":           "ok",
+		"pods":             podStatuses,
+		"external_servers": externalStatuses,
+		"pod_count":        len(pods),
+		"external_count":   len(externalServers),
+		"model_count":      len(h.discovery.GetAllModels()),
+		"loaded_count":     totalModels,
+		"unique_models":    h.discovery.GetAllModels(),
 	})
 }
 
-// routerPods returns detailed information about all pods
+// routerPods returns detailed information about all pods and external servers
 func (h *Handler) routerPods(w http.ResponseWriter, _ *http.Request) {
 	pods := h.discovery.GetAllPods()
+	externalServers := h.discovery.GetAllExternalServers()
 
 	type podInfo struct {
 		Name       string   `json:"name"`
-		IP         string   `json:"ip"`
-		NodeName   string   `json:"node_name"`
+		IP         string   `json:"ip,omitempty"`
+		URL        string   `json:"url,omitempty"`
+		NodeName   string   `json:"node_name,omitempty"`
 		Ready      bool     `json:"ready"`
 		Models     []string `json:"models"`
 		ModelCount int      `json:"model_count"`
+		External   bool     `json:"external"`
+		Weight     int      `json:"weight,omitempty"`
 	}
 
-	podInfos := make([]podInfo, 0, len(pods))
+	podInfos := make([]podInfo, 0, len(pods)+len(externalServers))
 	for _, pod := range pods {
 		podInfos = append(podInfos, podInfo{
 			Name:       pod.Name,
@@ -362,6 +483,19 @@ func (h *Handler) routerPods(w http.ResponseWriter, _ *http.Request) {
 			Ready:      pod.Ready,
 			Models:     pod.Models,
 			ModelCount: len(pod.Models),
+			External:   false,
+		})
+	}
+
+	for _, server := range externalServers {
+		podInfos = append(podInfos, podInfo{
+			Name:       server.Name,
+			URL:        server.URL,
+			Ready:      server.Healthy,
+			Models:     server.Models,
+			ModelCount: len(server.Models),
+			External:   true,
+			Weight:     server.Weight,
 		})
 	}
 
@@ -371,15 +505,27 @@ func (h *Handler) routerPods(w http.ResponseWriter, _ *http.Request) {
 	})
 }
 
-// routerModels returns models with their pod locations
+// routerModels returns models with their pod and external server locations
 func (h *Handler) routerModels(w http.ResponseWriter, _ *http.Request) {
 	models := h.discovery.GetAllModels()
+	externalServers := h.discovery.GetAllExternalServers()
+
+	// Build a map of model -> external servers
+	modelToExternalServers := make(map[string][]string)
+	for _, server := range externalServers {
+		if server.Healthy {
+			for _, model := range server.Models {
+				modelToExternalServers[model] = append(modelToExternalServers[model], server.Name)
+			}
+		}
+	}
 
 	type modelInfo struct {
-		Name     string   `json:"name"`
-		Pods     []string `json:"pods"`
-		Nodes    []string `json:"nodes"`
-		Replicas int      `json:"replicas"`
+		Name            string   `json:"name"`
+		Pods            []string `json:"pods"`
+		Nodes           []string `json:"nodes"`
+		ExternalServers []string `json:"external_servers,omitempty"`
+		Replicas        int      `json:"replicas"`
 	}
 
 	modelInfos := make([]modelInfo, 0, len(models))
@@ -397,11 +543,14 @@ func (h *Handler) routerModels(w http.ResponseWriter, _ *http.Request) {
 			}
 		}
 
+		externalServerNames := modelToExternalServers[model]
+
 		modelInfos = append(modelInfos, modelInfo{
-			Name:     model,
-			Pods:     podNames,
-			Nodes:    nodeNames,
-			Replicas: len(pods),
+			Name:            model,
+			Pods:            podNames,
+			Nodes:           nodeNames,
+			ExternalServers: externalServerNames,
+			Replicas:        len(pods) + len(externalServerNames),
 		})
 	}
 
