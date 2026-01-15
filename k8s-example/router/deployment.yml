@@ -19,6 +19,8 @@ spec:
       labels:
         app: rkllama-router
     spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
       serviceAccountName: rkllama-router
       containers:
         - name: router

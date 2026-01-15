@@ -16,13 +16,13 @@ data:
     models:
       # Replica-based placement - router picks nodes automatically
       # Good for load balancing when you don't care which specific nodes
-      qwen-7b:
-        replicas: 2
+      qwen3-4b:
+        replicas: 4
         priority: 10  # Higher priority, placed first
 
-      qwen-1.5b:
-        replicas: 4
-        priority: 5
+      # qwen-1.7b:
+      #   replicas: 4
+      #   priority: 5
 
       # Explicit node placement - you control exactly where
       # Use when specific nodes have specific hardware/memory
@@ -41,3 +41,11 @@ data:
     #   "qwen:7b": "qwen-7b"
     #   "qwen:1.5b": "qwen-1.5b"
     #   "qwen:latest": "qwen-7b"
+    externalServers:
+        # Local dev server without auth
+        - name: "local-dev"
+          url: "http://192.168.50.201:11434"
+          weight: 10
+        - name: "obelisk"
+          url: "http://192.168.50.114:11434"
+          weight: 10

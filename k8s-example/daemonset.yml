@@ -76,8 +76,9 @@ spec:
               mountPath: /sys
       volumes:
         - name: models
-          persistentVolumeClaim:
-            claimName: rkllama-models
+          nfs:
+           server: 192.168.50.227
+           path: /models
         - name: sys
           hostPath:
             path: /sys
@@ -89,3 +90,4 @@ spec:
           effect: "NoSchedule"
       nodeSelector:
         kubernetes.io/arch: arm64
+        node-type: npu
