@@ -1,11 +1,14 @@
 # Model assignment configuration
 #
-# Two modes:
+# Two modes for K8s pods:
 # 1. Replica-based (flexible): specify how many copies, router picks nodes
 # 2. Node-based (explicit): specify exactly which nodes should have the model
 #
 # Models are processed by priority (higher first) to ensure important
 # models get placed before less important ones.
+#
+# External servers can also be configured to include non-K8s Ollama instances
+# in the routing pool with weighted load balancing.
 
 apiVersion: v1
 kind: ConfigMap
@@ -35,3 +38,52 @@ data:
       # phi-2:
       #   nodes: ["node-3", "node-4"]
       #   priority: 1
+
+    # External servers - Ollama-compatible servers outside the K8s cluster
+    # These participate in round-robin load balancing with configurable weights.
+    # Models are discovered automatically via /api/tags polling.
+    #
+    # Rate limiting: Circuit breaker protects against 429 responses
+    #   - threshold: Number of 429s before tripping (default: 3)
+    #   - window: Seconds to count 429s in (default: 60)
+    #   - cooldown: Seconds to wait before retrying (default: 60)
+    #
+    # externalServers:
+    #   # External Ollama server with Bearer auth
+    #   - name: "remote-ollama"
+    #     url: "https://ollama.example.com"
+    #     weight: 3  # Gets 3 slots in round-robin (default: 1)
+    #     auth:
+    #       type: "bearer"  # Sends as "Authorization: Bearer <token>"
+    #       secretRef:
+    #         name: "ollama-credentials"
+    #         key: "api-key"
+    #
+    #   # External API with X-API-Key auth (e.g., Groq, Together AI)
+    #   - name: "groq-api"
+    #     url: "https://api.groq.com/openai/v1"
+    #     weight: 5  # Higher capacity server
+    #     auth:
+    #       type: "api-key"  # Sends as "X-API-Key: <token>"
+    #       secretRef:
+    #         name: "groq-secret"
+    #         key: "GROQ_API_KEY"
+    #
+    #   # OpenRouter free tier with aggressive rate limit protection
+    #   - name: "openrouter-free"
+    #     url: "https://openrouter.ai/api/v1"
+    #     weight: 1
+    #     rateLimit:
+    #       threshold: 3     # Trip after 3 429s
+    #       window: 60       # Within 60 seconds
+    #       cooldown: 300    # Wait 5 minutes before retrying
+    #     auth:
+    #       type: "bearer"
+    #       secretRef:
+    #         name: "openrouter-secret"
+    #         key: "api-key"
+    #
+    #   # Local dev server without auth
+    #   - name: "local-dev"
+    #     url: "http://192.168.1.100:11434"
+    #     weight: 1
